@@ -573,23 +573,43 @@ function DetailScreen({sub,onBack,onGuessAdded,isOwner}){
   const analyse=async()=>{
     if(!rec.blob||!rec.audioBuffer||!subBuf)return;
     setAnalysing(true);
+
+    // Score immediately — never blocks
     const score=compareAudio(subBuf,rec.audioBuffer);
     let text=`Match score: ${score}%.`;
+
+    // AI commentary — 8 second timeout so it never hangs
     try{
-      const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:180,messages:[{role:'user',content:`Fart acoustics analyst. This person scored ${score}/100 matching a fart. Under 50 is poor, 50-70 is decent, 70-85 is good, 85+ is excellent. Write exactly 1 dry sentence judging their performance. No emoji, no exclamation marks.`}]})});
-      const d=await res.json(); text=d.content?.[0]?.text||text;
-    }catch(e){}
+      const controller=new AbortController();
+      const timeout=setTimeout(()=>controller.abort(),8000);
+      const res=await fetch('https://api.anthropic.com/v1/messages',{
+        method:'POST',
+        signal:controller.signal,
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:120,messages:[{role:'user',content:`Fart acoustics analyst. Score: ${score}/100. Under 50 = poor, 50-70 = decent, 70-85 = good, 85+ = excellent. Write 1 dry sentence. No emoji, no exclamation marks.`}]})
+      });
+      clearTimeout(timeout);
+      const d=await res.json();
+      text=d.content?.[0]?.text||text;
+    }catch(e){ /* timeout or network — use default text */ }
+
+    // Save guess — also with error handling so it never blocks
     try{
       const filename=`guesses/${Date.now()}.webm`;
       const guessUrl=await uploadAudio(rec.blob,filename);
-      const {data}=await sb.from('guesses').insert({fart_id:sub.id,guesser_name:guestName||'Guest',score,analysis:text,audio_url:guessUrl}).select().single();
+      const {data}=await sb.from('guesses').insert({
+        fart_id:sub.id, guesser_name:guestName||'Guest',
+        score, analysis:text, audio_url:guessUrl
+      }).select().single();
       if(data){
         const ng={...data,name:data.guesser_name};
         const updated=[...guesses,ng].sort((a,b)=>b.score-a.score);
         setGuesses(updated);
         onGuessAdded(sub.id,updated.length);
       }
-    }catch(e){console.error(e);}
+    }catch(e){console.error('Save failed',e);}
+
+    // Always finish — never gets stuck
     setMyResult({score,analysis:text});
     setAnalysing(false);
     setUnlocked(true);
@@ -623,7 +643,11 @@ function DetailScreen({sub,onBack,onGuessAdded,isOwner}){
   if(!unlocked)return(
     <div style={{display:'flex',flexDirection:'column',height:'100%',background:C.white}}>
       <NavBar title={sub.name} onBack={()=>{rec.reset();onBack();}}/>
-      <div style={{flex:1,overflowY:'auto',WebkitOverflowScrolling:'touch',paddingBottom:20}}>
+
+      {/* Scrollable content */}
+      <div style={{flex:1,overflowY:'auto',WebkitOverflowScrolling:'touch',paddingBottom:160}}>
+
+        {/* Locked waveform preview */}
         <div style={{padding:'20px 16px',borderBottom:`1px solid ${C.border}`}}>
           <div style={{fontSize:12,color:C.text3,marginBottom:14,fontWeight:500}}>{formatDate(sub.date)} · {fmt(sub.duration)}</div>
           <div style={{position:'relative',marginBottom:14,borderRadius:10,overflow:'hidden'}}>
@@ -643,23 +667,32 @@ function DetailScreen({sub,onBack,onGuessAdded,isOwner}){
             <div style={{fontSize:14,color:C.text3}}>Locked until you guess</div>
           </div>
         </div>
-        <div style={{padding:'20px 16px 32px'}}>
+
+        {/* Record area */}
+        <div style={{padding:'20px 16px'}}>
           <div style={{fontSize:20,fontWeight:700,color:C.text,letterSpacing:'-0.02em',marginBottom:4}}>Your Guess</div>
           <div style={{fontSize:13,color:C.text3,marginBottom:20,lineHeight:1.5}}>Record your fart. You'll hear the original after you submit.</div>
-          <div style={{background:C.purpleBg,borderRadius:14,padding:'24px 20px',display:'flex',flexDirection:'column',alignItems:'center',gap:14,border:`1px solid ${C.purpleBorder}`}}>
-            <div style={{fontSize:13,color:C.text3,textAlign:'center'}}>{rec.audioBuffer?'Tap to re-record.':'Record your fart below.'}</div>
-            <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:8}}>
-              <RecordButton recording={rec.recording} onToggle={rec.toggle} size="small"/>
-              <div style={{fontSize:12,color:C.text3}}>{rec.recording?`Recording · ${fmt(rec.secs)}`:rec.audioBuffer?'Tap to re-record':'Tap to record'}</div>
-            </div>
-            {rec.audioBuffer&&!rec.recording&&<div style={{width:'100%'}}><BigWave buffer={rec.audioBuffer} height={36} color={C.purpleLight}/></div>}
+
+          <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:12,background:C.purpleBg,borderRadius:14,padding:'28px 20px',border:`1px solid ${C.purpleBorder}`}}>
+            <RecordButton recording={rec.recording} onToggle={rec.toggle} size="small"/>
+            <div style={{fontSize:13,color:C.text3}}>{rec.recording?`Recording · ${fmt(rec.secs)}`:rec.audioBuffer?'Tap to re-record':'Tap to record'}</div>
             {rec.audioBuffer&&!rec.recording&&(
-              <button onClick={analyse} disabled={analysing} style={{width:'100%',padding:14,borderRadius:12,border:'none',background:analysing?`rgba(123,94,167,0.5)`:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,color:'white',fontFamily:"'Open Sans',sans-serif",fontSize:15,fontWeight:700,cursor:analysing?'not-allowed':'pointer',display:'flex',alignItems:'center',justifyContent:'center',gap:8,boxShadow:analysing?'none':`0 4px 14px rgba(123,94,167,0.28)`}}>
-                {analysing&&<Spinner white/>}{analysing?'Analysing…':'Submit & Reveal'}
-              </button>
+              <div style={{width:'100%'}}><BigWave buffer={rec.audioBuffer} height={40} color={C.purpleLight}/></div>
             )}
           </div>
         </div>
+      </div>
+
+      {/* Pinned submit button */}
+      <div style={{position:'absolute',bottom:0,left:0,right:0,background:'rgba(255,255,255,0.97)',backdropFilter:'blur(20px)',WebkitBackdropFilter:'blur(20px)',borderTop:`1px solid ${C.border}`,padding:`14px 16px calc(14px + env(safe-area-inset-bottom))`}}>
+        <button
+          onClick={analyse}
+          disabled={!rec.audioBuffer||rec.recording||analysing}
+          style={{width:'100%',padding:16,borderRadius:14,border:'none',background:(!rec.audioBuffer||rec.recording||analysing)?`rgba(123,94,167,0.35)`:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,color:'white',fontFamily:"'Open Sans',sans-serif",fontSize:16,fontWeight:700,cursor:(!rec.audioBuffer||rec.recording||analysing)?'not-allowed':'pointer',display:'flex',alignItems:'center',justifyContent:'center',gap:8,boxShadow:(!rec.audioBuffer||analysing)?'none':`0 4px 16px rgba(123,94,167,0.3)`}}
+        >
+          {analysing&&<Spinner white/>}
+          {analysing?'Analysing…':rec.audioBuffer&&!rec.recording?'Submit & Reveal':'Record your fart first'}
+        </button>
       </div>
     </div>
   );
