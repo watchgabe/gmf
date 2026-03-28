@@ -40,7 +40,8 @@ async function uploadAudio(blob, filename) {
   return data.publicUrl;
 }
 
-// ── Master audio context (reused) ──
+// ── Master audio context ──
+// iOS/Safari requires AudioContext to be created inside a user gesture
 let masterCtx = null;
 function getAudioCtx() {
   if(!masterCtx || masterCtx.state === 'closed') {
@@ -50,104 +51,152 @@ function getAudioCtx() {
   return masterCtx;
 }
 
-// ── Fetch audio and decode — works around CORS by using ArrayBuffer ──
+// Unlock audio on first touch — required for iOS Safari
+function unlockAudio() {
+  const ctx = getAudioCtx();
+  if(ctx.state === 'suspended') {
+    ctx.resume();
+    // Play a silent buffer to unlock
+    const buf = ctx.createBuffer(1,1,22050);
+    const src = ctx.createBufferSource();
+    src.buffer = buf; src.connect(ctx.destination); src.start(0);
+  }
+}
+// Attach to first user interaction
+if(typeof document !== 'undefined') {
+  const unlock = () => { unlockAudio(); document.removeEventListener('touchstart', unlock); document.removeEventListener('click', unlock); };
+  document.addEventListener('touchstart', unlock, {passive:true});
+  document.addEventListener('click', unlock);
+}
+
+// ── Fetch + decode audio ──
 const audioBufferCache = {};
 async function fetchAudioBuffer(url) {
   if(audioBufferCache[url]) return audioBufferCache[url];
-  // Try direct fetch first
+  const ctx = getAudioCtx();
   let arrayBuf;
   try {
-    const res = await fetch(url, {mode:'cors', cache:'force-cache'});
+    const res = await fetch(url, {cache:'force-cache'});
     if(!res.ok) throw new Error(`HTTP ${res.status}`);
     arrayBuf = await res.arrayBuffer();
   } catch(e) {
-    // Fallback: try no-cors mode via signed URL
+    // Signed URL fallback
     const path = url.includes('/fart-audio/') ? url.split('/fart-audio/')[1].split('?')[0] : null;
     if(path) {
       const {data} = await sb.storage.from(BUCKET).createSignedUrl(path, 3600);
-      if(data?.signedUrl) {
-        const res2 = await fetch(data.signedUrl);
-        arrayBuf = await res2.arrayBuffer();
-      }
+      if(data?.signedUrl) { const r = await fetch(data.signedUrl); arrayBuf = await r.arrayBuffer(); }
     }
     if(!arrayBuf) throw e;
   }
-  const ctx = getAudioCtx();
   const buf = await ctx.decodeAudioData(arrayBuf.slice(0));
   audioBufferCache[url] = buf;
   return buf;
 }
 
-// Play a buffer — returns a stop function
 function playBuffer(buf) {
   const ctx = getAudioCtx();
   const src = ctx.createBufferSource();
+  const gain = ctx.createGain();
+  gain.gain.value = 1.0;
   src.buffer = buf;
-  src.connect(ctx.destination);
+  src.connect(gain); gain.connect(ctx.destination);
   src.start(0);
   return () => { try { src.stop(); } catch(e) {} };
 }
 
-async function urlToAudioBuffer(url) {
-  return await fetchAudioBuffer(url);
+async function urlToAudioBuffer(url) { return fetchAudioBuffer(url); }
+
+// ── SCORING: strip silence, compare pitch + peak structure ──
+
+// Find where actual sound starts and ends (silence threshold)
+function trimSilence(data, threshold=0.02) {
+  const len = data.length;
+  let start = 0, end = len - 1;
+  // Find first sample above threshold
+  for(let i=0; i<len; i++) { if(Math.abs(data[i]) > threshold) { start = Math.max(0, i-100); break; } }
+  // Find last sample above threshold
+  for(let i=len-1; i>=0; i--) { if(Math.abs(data[i]) > threshold) { end = Math.min(len-1, i+100); break; } }
+  return data.slice(start, end+1);
 }
 
-// ── Better audio comparison — more discriminating ──
-function extractFeatures(buf) {
-  const d = buf.getChannelData(0), len = d.length, sr = buf.sampleRate;
-  // RMS energy
-  let ss = 0; for(let i=0;i<len;i++) ss+=d[i]*d[i];
-  const rms = Math.sqrt(ss/len);
-  // Zero crossing rate
-  let zcr = 0; for(let i=1;i<len;i++) if((d[i]>=0)!==(d[i-1]>=0)) zcr++; zcr/=len;
-  // Spectral centroid
-  const fftSize=4096, frames=Math.floor(len/fftSize); let cS=0;
-  for(let f=0;f<frames;f++){let w=0,t=0;for(let k=0;k<fftSize;k++){const m=Math.abs(d[f*fftSize+k]);w+=k*m;t+=m;}cS+=t?w/t:0;}
-  const cent = cS/(frames||1);
-  // Envelope (10 segments)
-  const seg=Math.floor(len/10), env=[];
-  for(let s=0;s<10;s++){let e=0;for(let k=0;k<seg;k++)e+=Math.abs(d[s*seg+k]||0);env.push(e/seg);}
-  // Peak count (roughness)
-  let peaks=0;
-  for(let i=1;i<len-1;i++) if(d[i]>d[i-1]&&d[i]>d[i+1]&&Math.abs(d[i])>0.05) peaks++;
-  // Low-freq energy (first 300Hz)
-  const lowLen=Math.floor(sr*0.05); let lowE=0;
-  for(let i=0;i<Math.min(lowLen,len);i++) lowE+=d[i]*d[i];
-  lowE=Math.sqrt(lowE/Math.min(lowLen,len));
-  return {dur:buf.duration, rms, zcr, cent, env, peaks:peaks/len, lowE};
+// Estimate dominant pitch using autocorrelation
+function estimatePitch(data, sr) {
+  const minPeriod = Math.floor(sr/600); // 600Hz max
+  const maxPeriod = Math.floor(sr/60);  // 60Hz min
+  const len = Math.min(data.length, sr * 0.5); // use first 0.5s
+  let bestCorr = -1, bestPeriod = maxPeriod;
+  for(let p=minPeriod; p<=maxPeriod; p++) {
+    let corr = 0;
+    for(let i=0; i<len-p; i++) corr += data[i] * data[i+p];
+    corr /= (len-p);
+    if(corr > bestCorr) { bestCorr = corr; bestPeriod = p; }
+  }
+  return sr / bestPeriod; // Hz
 }
 
-function compareAudio(orig, guess) {
-  const a=extractFeatures(orig), b=extractFeatures(guess);
-  // Duration — exponential penalty for mismatch
-  const durRatio = Math.min(a.dur,b.dur)/Math.max(a.dur,b.dur);
-  const durScore = Math.pow(durRatio, 2); // square to penalise more
-  // RMS (loudness profile)
-  const rmsDiff = Math.abs(a.rms-b.rms)/(Math.max(a.rms,b.rms)||.001);
-  const rmsScore = Math.max(0, 1 - rmsDiff*2);
-  // ZCR (texture/roughness)
-  const zcrDiff = Math.abs(a.zcr-b.zcr)/(Math.max(a.zcr,b.zcr)||.001);
-  const zcrScore = Math.max(0, 1 - zcrDiff*3);
-  // Spectral centroid (brightness)
-  const cenDiff = Math.abs(a.cent-b.cent)/(Math.max(a.cent,b.cent)||.001);
-  const cenScore = Math.max(0, 1 - cenDiff*2);
-  // Envelope shape
-  let envScore=0;
-  const aM=Math.max(...a.env)||1, bM=Math.max(...b.env)||1;
-  for(let i=0;i<10;i++) envScore+=1-Math.min(1,Math.abs(a.env[i]/aM-b.env[i]/bM)*2);
-  envScore/=10;
-  // Peak density
-  const pkDiff = Math.abs(a.peaks-b.peaks)/(Math.max(a.peaks,b.peaks)||.001);
-  const pkScore = Math.max(0, 1-pkDiff*2);
-  // Low freq
-  const lowDiff = Math.abs(a.lowE-b.lowE)/(Math.max(a.lowE,b.lowE)||.001);
-  const lowScore = Math.max(0, 1-lowDiff*2);
+// Count peaks above a threshold (normalised)
+function countPeaks(data, threshold=0.1) {
+  const maxAmp = Math.max(...data.map(Math.abs)) || 1;
+  const norm = threshold * maxAmp;
+  let peaks = 0;
+  for(let i=1; i<data.length-1; i++) {
+    if(data[i]>data[i-1] && data[i]>data[i+1] && data[i]>norm) peaks++;
+  }
+  return peaks;
+}
 
-  const raw = durScore*.20 + rmsScore*.15 + zcrScore*.20 + cenScore*.15 + envScore*.15 + pkScore*.10 + lowScore*.05;
-  // Spread scores more — map 0.3-0.9 range to 0-100 so avg fart gets ~40-60
-  const spread = Math.max(0, Math.min(1, (raw - 0.25) / 0.65));
+// Normalised envelope shape (20 buckets)
+function getEnvelope(data, buckets=20) {
+  const seg = Math.floor(data.length / buckets);
+  const env = [];
+  for(let i=0; i<buckets; i++) {
+    let e=0; for(let k=0;k<seg;k++) e+=Math.abs(data[i*seg+k]||0);
+    env.push(e/seg);
+  }
+  const mx = Math.max(...env) || 1;
+  return env.map(v=>v/mx);
+}
+
+function compareAudio(origBuf, guessBuf) {
+  const sr = origBuf.sampleRate;
+  // Trim silence from both — this makes timing irrelevant
+  const origRaw = origBuf.getChannelData(0);
+  const guessRaw = guessBuf.getChannelData(0);
+  const orig = trimSilence(origRaw);
+  const guess = trimSilence(guessRaw);
+
+  if(orig.length < 100 || guess.length < 100) return 20;
+
+  // 1. Pitch similarity (40% weight) — most important
+  const origPitch = estimatePitch(orig, sr);
+  const guessPitch = estimatePitch(guess, sr);
+  const pitchRatio = Math.min(origPitch, guessPitch) / Math.max(origPitch, guessPitch);
+  const pitchScore = Math.pow(pitchRatio, 1.5); // punish pitch mismatches hard
+
+  // 2. Peak count similarity (30% weight) — number of sounds
+  const origPeaks = countPeaks(orig);
+  const guessPeaks = countPeaks(guess);
+  const peakRatio = Math.min(origPeaks, guessPeaks) / (Math.max(origPeaks, guessPeaks) || 1);
+  const peakScore = peakRatio;
+
+  // 3. Envelope / waveform shape (20% weight)
+  const origEnv = getEnvelope(orig);
+  const guessEnv = getEnvelope(guess);
+  let envScore = 0;
+  for(let i=0;i<20;i++) envScore += 1 - Math.min(1, Math.abs(origEnv[i]-guessEnv[i])*2);
+  envScore /= 20;
+
+  // 4. Duration of actual sound (10% weight) — after silence stripped
+  const durRatio = Math.min(orig.length, guess.length) / Math.max(orig.length, guess.length);
+  const durScore = durRatio;
+
+  const raw = pitchScore*0.40 + peakScore*0.30 + envScore*0.20 + durScore*0.10;
+
+  // Map to 0–100 with good spread (0.2–0.9 raw → 0–100)
+  const spread = Math.max(0, Math.min(1, (raw - 0.20) / 0.70));
   return Math.round(spread * 100);
 }
+
 
 const C = {
   purple:"#7B5EA7", purpleLight:"#9B7EC8",
