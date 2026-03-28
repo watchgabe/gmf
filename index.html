@@ -12,14 +12,15 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
-  html,body{height:100%;-webkit-font-smoothing:antialiased;font-family:'Open Sans',sans-serif;overflow:hidden;}
-  #root{height:100vh;display:flex;justify-content:center;background:#ece8f4;}
+  html,body{height:100%;-webkit-font-smoothing:antialiased;font-family:'Open Sans',sans-serif;overflow:hidden;background:#ece8f4;}
+  #root{height:100vh;display:flex;justify-content:center;}
   #shell{height:100vh;width:100%;max-width:480px;position:relative;overflow:hidden;background:#F5F3FA;box-shadow:0 0 60px rgba(123,94,167,0.15);}
   @keyframes barPulse{0%,100%{height:5px;opacity:.25;}50%{height:42px;opacity:.9;}}
   @keyframes blink{0%,100%{opacity:1;}50%{opacity:0;}}
   @keyframes slideUp{from{transform:translateY(100%);}to{transform:translateY(0);}}
   @keyframes spin{to{transform:rotate(360deg);}}
   ::-webkit-scrollbar{display:none;}
+  input,button{-webkit-appearance:none;appearance:none;}
 </style>
 </head>
 <body>
@@ -27,31 +28,82 @@
 <script type="text/babel">
 const { useState, useRef, useEffect, useCallback } = React;
 
-// ── Supabase ──
 const SUPA_URL = 'https://ljddfhzrjvxpedvfebli.supabase.co';
 const SUPA_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxqZGRmaHpyanZ4cGVkdmZlYmxpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM5NTEzNjMsImV4cCI6MjA4OTUyNzM2M30.GqZMRvBlZyN4rmr9MrfxLcLSB04d7s59ZPfEw-dQwks';
 const sb = supabase.createClient(SUPA_URL, SUPA_KEY);
 const BUCKET = 'fart-audio';
 
-// ── Upload audio blob to Supabase Storage, return public URL ──
 async function uploadAudio(blob, filename) {
-  const { data, error } = await sb.storage.from(BUCKET).upload(filename, blob, {
-    contentType: 'audio/webm', upsert: true,
-  });
-  if (error) throw error;
-  const { data: urlData } = sb.storage.from(BUCKET).getPublicUrl(filename);
-  return urlData.publicUrl;
+  const {error} = await sb.storage.from(BUCKET).upload(filename, blob, {contentType:'audio/webm',upsert:true});
+  if(error) throw error;
+  const {data} = sb.storage.from(BUCKET).getPublicUrl(filename);
+  return data.publicUrl;
 }
 
-// ── Fetch audio URL → AudioBuffer ──
 async function urlToAudioBuffer(url) {
   const res = await fetch(url);
   const ab = await res.arrayBuffer();
-  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const ctx = new (window.AudioContext||window.webkitAudioContext)();
   return await ctx.decodeAudioData(ab);
 }
 
-// ── Palette ──
+// ── Better audio comparison — more discriminating ──
+function extractFeatures(buf) {
+  const d = buf.getChannelData(0), len = d.length, sr = buf.sampleRate;
+  // RMS energy
+  let ss = 0; for(let i=0;i<len;i++) ss+=d[i]*d[i];
+  const rms = Math.sqrt(ss/len);
+  // Zero crossing rate
+  let zcr = 0; for(let i=1;i<len;i++) if((d[i]>=0)!==(d[i-1]>=0)) zcr++; zcr/=len;
+  // Spectral centroid
+  const fftSize=4096, frames=Math.floor(len/fftSize); let cS=0;
+  for(let f=0;f<frames;f++){let w=0,t=0;for(let k=0;k<fftSize;k++){const m=Math.abs(d[f*fftSize+k]);w+=k*m;t+=m;}cS+=t?w/t:0;}
+  const cent = cS/(frames||1);
+  // Envelope (10 segments)
+  const seg=Math.floor(len/10), env=[];
+  for(let s=0;s<10;s++){let e=0;for(let k=0;k<seg;k++)e+=Math.abs(d[s*seg+k]||0);env.push(e/seg);}
+  // Peak count (roughness)
+  let peaks=0;
+  for(let i=1;i<len-1;i++) if(d[i]>d[i-1]&&d[i]>d[i+1]&&Math.abs(d[i])>0.05) peaks++;
+  // Low-freq energy (first 300Hz)
+  const lowLen=Math.floor(sr*0.05); let lowE=0;
+  for(let i=0;i<Math.min(lowLen,len);i++) lowE+=d[i]*d[i];
+  lowE=Math.sqrt(lowE/Math.min(lowLen,len));
+  return {dur:buf.duration, rms, zcr, cent, env, peaks:peaks/len, lowE};
+}
+
+function compareAudio(orig, guess) {
+  const a=extractFeatures(orig), b=extractFeatures(guess);
+  // Duration — exponential penalty for mismatch
+  const durRatio = Math.min(a.dur,b.dur)/Math.max(a.dur,b.dur);
+  const durScore = Math.pow(durRatio, 2); // square to penalise more
+  // RMS (loudness profile)
+  const rmsDiff = Math.abs(a.rms-b.rms)/(Math.max(a.rms,b.rms)||.001);
+  const rmsScore = Math.max(0, 1 - rmsDiff*2);
+  // ZCR (texture/roughness)
+  const zcrDiff = Math.abs(a.zcr-b.zcr)/(Math.max(a.zcr,b.zcr)||.001);
+  const zcrScore = Math.max(0, 1 - zcrDiff*3);
+  // Spectral centroid (brightness)
+  const cenDiff = Math.abs(a.cent-b.cent)/(Math.max(a.cent,b.cent)||.001);
+  const cenScore = Math.max(0, 1 - cenDiff*2);
+  // Envelope shape
+  let envScore=0;
+  const aM=Math.max(...a.env)||1, bM=Math.max(...b.env)||1;
+  for(let i=0;i<10;i++) envScore+=1-Math.min(1,Math.abs(a.env[i]/aM-b.env[i]/bM)*2);
+  envScore/=10;
+  // Peak density
+  const pkDiff = Math.abs(a.peaks-b.peaks)/(Math.max(a.peaks,b.peaks)||.001);
+  const pkScore = Math.max(0, 1-pkDiff*2);
+  // Low freq
+  const lowDiff = Math.abs(a.lowE-b.lowE)/(Math.max(a.lowE,b.lowE)||.001);
+  const lowScore = Math.max(0, 1-lowDiff*2);
+
+  const raw = durScore*.20 + rmsScore*.15 + zcrScore*.20 + cenScore*.15 + envScore*.15 + pkScore*.10 + lowScore*.05;
+  // Spread scores more — map 0.3-0.9 range to 0-100 so avg fart gets ~40-60
+  const spread = Math.max(0, Math.min(1, (raw - 0.25) / 0.65));
+  return Math.round(spread * 100);
+}
+
 const C = {
   purple:"#7B5EA7", purpleLight:"#9B7EC8",
   purpleBg:"#F3F0F9", purpleBorder:"rgba(123,94,167,0.18)",
@@ -60,14 +112,13 @@ const C = {
   green:"#22c55e",
 };
 
-const fmt = s => { const n=Math.floor(s); return `${Math.floor(n/60)}:${String(n%60).padStart(2,'0')}`; };
+const fmt = s => {const n=Math.floor(s);return`${Math.floor(n/60)}:${String(n%60).padStart(2,'0')}`;};
 const formatDate = d => {
   const now=new Date(), today=now.toDateString()===d.toDateString();
   return today ? d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})
     : d.toLocaleDateString('en-US',{month:'short',day:'numeric'})+' · '+d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
 };
 
-// ── Waveform ──
 function drawWaveform(canvas,buffer,color){
   if(!canvas||!buffer)return;
   const ctx=canvas.getContext('2d'),W=canvas.width,H=canvas.height;
@@ -80,111 +131,139 @@ function drawWaveform(canvas,buffer,color){
   }
   ctx.stroke();
 }
+
 function MiniWave({buffer}){
   const ref=useRef(null);
   useEffect(()=>{if(buffer&&ref.current)drawWaveform(ref.current,buffer,C.purpleLight);},[buffer]);
   return <canvas ref={ref} width={36} height={24} style={{display:'block',width:36,height:24}}/>;
 }
+
 function BigWave({buffer,color,height=64}){
   const ref=useRef(null);
   useEffect(()=>{if(buffer&&ref.current)drawWaveform(ref.current,buffer,color||C.purple);},[buffer,color]);
   return <canvas ref={ref} width={600} height={height} style={{width:'100%',height,display:'block',borderRadius:10,background:C.purpleBg}}/>;
 }
 
-// ── Audio analysis ──
-function extractFeatures(buf){
-  const d=buf.getChannelData(0),len=d.length;
-  let ss=0; for(let i=0;i<len;i++) ss+=d[i]*d[i];
-  const rms=Math.sqrt(ss/len);
-  let zcr=0; for(let i=1;i<len;i++) if((d[i]>=0)!==(d[i-1]>=0)) zcr++; zcr/=len;
-  const fs=2048,fr=Math.floor(len/fs); let cS=0;
-  for(let f=0;f<fr;f++){let w=0,t=0;for(let k=0;k<fs;k++){const m=Math.abs(d[f*fs+k]);w+=k*m;t+=m;}cS+=t?w/t:0;}
-  const seg=Math.floor(len/10),env=[];
-  for(let s=0;s<10;s++){let e=0;for(let k=0;k<seg;k++)e+=Math.abs(d[s*seg+k]||0);env.push(e/seg);}
-  return{dur:buf.duration,rms,zcr,cent:cS/(fr||1),env};
-}
-function compareAudio(orig,guess){
-  const a=extractFeatures(orig),b=extractFeatures(guess);
-  const dur=Math.min(a.dur,b.dur)/Math.max(a.dur,b.dur);
-  const rms=Math.max(0,1-Math.abs(a.rms-b.rms)/(Math.max(a.rms,b.rms)||.001));
-  const zcr=Math.max(0,1-Math.abs(a.zcr-b.zcr)/(Math.max(a.zcr,b.zcr)||.001)*2);
-  const cen=Math.max(0,1-Math.abs(a.cent-b.cent)/(Math.max(a.cent,b.cent)||.001));
-  let env=0; const aM=Math.max(...a.env)||1,bM=Math.max(...b.env)||1;
-  for(let i=0;i<10;i++) env+=1-Math.min(1,Math.abs(a.env[i]/aM-b.env[i]/bM)); env/=10;
-  return Math.round((dur*.25+rms*.15+zcr*.25+cen*.15+env*.20)*100);
+function Spinner({white,size=18}){
+  const c=white?'rgba(255,255,255,0.4)':C.purpleBorder, tc=white?'white':C.purple;
+  return <div style={{width:size,height:size,border:`2px solid ${c}`,borderTopColor:tc,borderRadius:'50%',animation:'spin .7s linear infinite',flexShrink:0}}/>;
 }
 
-// ── Spinner ──
-function Spinner({white}){
-  const c=white?'rgba(255,255,255,0.5)':C.purpleBorder, tc=white?'white':C.purple;
-  return <div style={{width:18,height:18,border:`2px solid ${c}`,borderTopColor:tc,borderRadius:'50%',animation:'spin .7s linear infinite',flexShrink:0}}/>;
-}
-
-// ── Record Button ──
 function RecordButton({recording,onToggle,size='large'}){
-  const os=size==='large'?120:80, is=size==='large'?88:60, sq=size==='large'?34:24, bw=size==='large'?4:3;
+  const os=size==='large'?110:76, is=size==='large'?82:56, sq=size==='large'?30:22, bw=size==='large'?4:3;
   return(
     <button onClick={onToggle} style={{width:os,height:os,borderRadius:'50%',border:`${bw}px solid ${C.purple}`,background:'white',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',padding:0,WebkitTapHighlightColor:'transparent',flexShrink:0,boxShadow:`0 4px 20px rgba(123,94,167,0.25)`}}>
-      <div style={{width:recording?sq:is,height:recording?sq:is,borderRadius:recording?(size==='large'?12:8):'50%',background:C.purple,transition:'all .28s cubic-bezier(.4,0,.2,1)'}}/>
+      <div style={{width:recording?sq:is,height:recording?sq:is,borderRadius:recording?(size==='large'?10:7):'50%',background:C.purple,transition:'all .28s cubic-bezier(.4,0,.2,1)'}}/>
     </button>
   );
 }
 
-// ── NavBar ──
 function NavBar({title,onBack,rightSlot}){
   return(
-    <div style={{background:'rgba(245,243,250,0.96)',backdropFilter:'blur(20px)',borderBottom:`1px solid ${C.purpleBorder}`,padding:'0 16px',display:'flex',alignItems:'flex-end',height:88,paddingBottom:12,flexShrink:0,gap:8}}>
+    <div style={{background:'rgba(245,243,250,0.96)',backdropFilter:'blur(20px)',WebkitBackdropFilter:'blur(20px)',borderBottom:`1px solid ${C.purpleBorder}`,padding:'0 16px',display:'flex',alignItems:'flex-end',height:80,paddingBottom:10,flexShrink:0,gap:8}}>
       {onBack?(
-        <button onClick={onBack} style={{background:'none',border:'none',color:C.purple,fontFamily:"'Open Sans',sans-serif",fontSize:17,cursor:'pointer',display:'flex',alignItems:'center',gap:5,minWidth:80,padding:0}}>
-          <svg width="10" height="17" viewBox="0 0 10 17" fill="none"><path d="M8.5 1.5L1.5 8.5L8.5 15.5" stroke={C.purple} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>
-          GMF App
+        <button onClick={onBack} style={{background:'none',border:'none',color:C.purple,fontFamily:"'Open Sans',sans-serif",fontSize:16,cursor:'pointer',display:'flex',alignItems:'center',gap:4,minWidth:70,padding:0,WebkitTapHighlightColor:'transparent'}}>
+          <svg width="9" height="15" viewBox="0 0 9 15" fill="none"><path d="M7.5 1.5L1.5 7.5L7.5 13.5" stroke={C.purple} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          Back
         </button>
       ):(
-        <div style={{minWidth:80,display:'flex',alignItems:'center',gap:8}}>
-          <div style={{width:28,height:28,borderRadius:8,background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,display:'flex',alignItems:'center',justifyContent:'center'}}>
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M7 1C4 1 2 3 2 5.5c0 2 1.5 3.5 3 4.5L7 13l2-3c1.5-1 3-2.5 3-4.5C12 3 10 1 7 1z" fill="white"/></svg>
+        <div style={{minWidth:70,display:'flex',alignItems:'center',gap:7}}>
+          <div style={{width:26,height:26,borderRadius:7,background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>
+            <svg width="13" height="13" viewBox="0 0 14 14" fill="none"><path d="M7 1C4 1 2 3 2 5.5c0 2 1.5 3.5 3 4.5L7 13l2-3c1.5-1 3-2.5 3-4.5C12 3 10 1 7 1z" fill="white"/></svg>
           </div>
-          <span style={{fontSize:15,fontWeight:700,color:C.purple,letterSpacing:'-0.01em'}}>GMF App</span>
+          <span style={{fontSize:14,fontWeight:700,color:C.purple,letterSpacing:'-0.01em'}}>GMF App</span>
         </div>
       )}
-      <div style={{flex:1,textAlign:'center',fontSize:17,fontWeight:600,color:C.text,letterSpacing:'-0.02em'}}>{title}</div>
-      <div style={{minWidth:80,display:'flex',justifyContent:'flex-end'}}>{rightSlot}</div>
-    </div>
-  );
-}
-
-// ── Share Modal ──
-function ShareModal({sub,onClose}){
-  const [copied,setCopied]=useState(false);
-  const url=`https://watchgabe.github.io/gmf?fart=${sub.id}`;
-  const msg=`Can you guess my fart? 👃\n\nTap the link, record yours, and see how close you get:\n${url}`;
-  const copy=()=>{navigator.clipboard.writeText(msg).catch(()=>{});setCopied(true);setTimeout(()=>setCopied(false),2500);};
-  return(
-    <div onClick={onClose} style={{position:'fixed',inset:0,zIndex:100,background:'rgba(26,26,46,0.55)',display:'flex',alignItems:'flex-end',justifyContent:'center'}}>
-      <div onClick={e=>e.stopPropagation()} style={{background:C.white,borderRadius:'20px 20px 0 0',padding:'24px 24px calc(32px + env(safe-area-inset-bottom))',width:'100%',maxWidth:480,boxShadow:'0 -8px 40px rgba(123,94,167,0.2)',animation:'slideUp .28s ease'}}>
-        <div style={{width:36,height:4,borderRadius:2,background:C.border,margin:'0 auto 20px'}}/>
-        <div style={{fontSize:19,fontWeight:700,color:C.text,marginBottom:4,letterSpacing:'-0.02em'}}>Invite to Guess</div>
-        <div style={{fontSize:13,color:C.text3,marginBottom:18,lineHeight:1.5}}>Friends tap the link, record their fart, get scored — before they hear yours.</div>
-        <div style={{background:C.purpleBg,borderRadius:10,padding:'12px 14px',marginBottom:14,fontSize:13,color:C.text2,lineHeight:1.7,whiteSpace:'pre-line',wordBreak:'break-all',border:`1px solid ${C.purpleBorder}`}}>{msg}</div>
-        <button onClick={copy} style={{width:'100%',padding:15,borderRadius:12,border:'none',background:copied?C.green:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,color:'white',fontFamily:"'Open Sans',sans-serif",fontSize:15,fontWeight:700,cursor:'pointer',marginBottom:10,transition:'background .2s',display:'flex',alignItems:'center',justifyContent:'center',gap:8}}>
-          {copied?'✓ Copied!':'Copy Invite Link'}
-        </button>
-        {navigator.share&&(
-          <button onClick={()=>navigator.share({text:msg}).catch(()=>{})} style={{width:'100%',padding:15,borderRadius:12,border:`1.5px solid ${C.purpleBorder}`,background:'white',fontFamily:"'Open Sans',sans-serif",fontSize:15,fontWeight:600,color:C.purple,cursor:'pointer'}}>
-            Share via…
-          </button>
-        )}
+      <div style={{flex:1,textAlign:'center',fontSize:16,fontWeight:600,color:C.text,letterSpacing:'-0.02em',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',padding:'0 8px'}}>{title}</div>
+      <div style={{minWidth:70,display:'flex',justifyContent:'flex-end'}}>
+        {rightSlot}
       </div>
     </div>
   );
 }
 
-// ── useRecorder ──
+// ── Audio Player Component ──
+function AudioPlayer({url, buffer, label="Tap to play"}){
+  const [state,setState]=useState('idle'); // idle | loading | playing | paused | error
+  const audioRef=useRef(null);
+
+  useEffect(()=>{
+    return()=>{ if(audioRef.current){audioRef.current.pause();audioRef.current.src='';} };
+  },[url]);
+
+  const toggle=async()=>{
+    if(state==='loading')return;
+    if(state==='playing'){
+      audioRef.current.pause();
+      setState('paused');
+      return;
+    }
+    if(state==='paused'&&audioRef.current){
+      audioRef.current.play().catch(()=>setState('error'));
+      setState('playing');
+      return;
+    }
+    // idle or error — create fresh
+    setState('loading');
+    try{
+      const audio=new Audio();
+      audio.crossOrigin='anonymous';
+      audioRef.current=audio;
+      audio.onended=()=>setState('idle');
+      audio.onerror=()=>setState('error');
+      audio.oncanplaythrough=()=>{
+        audio.play().then(()=>setState('playing')).catch(()=>setState('error'));
+      };
+      audio.src=url;
+      audio.load();
+    }catch(e){ setState('error'); }
+  };
+
+  const icon = ()=>{
+    if(state==='loading') return <Spinner white size={16}/>;
+    if(state==='playing') return(
+      <svg width="12" height="14" viewBox="0 0 12 14" fill="none"><rect x="1" y="1" width="3.5" height="12" rx="1" fill="white"/><rect x="7.5" y="1" width="3.5" height="12" rx="1" fill="white"/></svg>
+    );
+    return <svg width="13" height="15" viewBox="0 0 14 16" fill="none"><path d="M2 1.5L13 8L2 14.5V1.5Z" fill="white"/></svg>;
+  };
+
+  return(
+    <div style={{display:'flex',alignItems:'center',gap:12}}>
+      <button onClick={toggle} style={{width:44,height:44,borderRadius:'50%',background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:state==='loading'?'wait':'pointer',flexShrink:0,boxShadow:`0 3px 12px rgba(123,94,167,0.3)`,WebkitTapHighlightColor:'transparent'}}>
+        {icon()}
+      </button>
+      <div style={{fontSize:14,color:C.text3}}>
+        {state==='playing'?'Playing…':state==='loading'?'Loading…':state==='error'?'Error loading audio':label}
+      </div>
+    </div>
+  );
+}
+
+function ShareModal({sub,onClose}){
+  const [copied,setCopied]=useState(false);
+  const url=`https://watchgabe.github.io/gmf?fart=${sub.id}`;
+  const msg=`Can you guess my fart? 💨\n\nTap the link, record your best match, and see your score:\n${url}`;
+  const copy=()=>{navigator.clipboard.writeText(msg).catch(()=>{});setCopied(true);setTimeout(()=>setCopied(false),2500);};
+  return(
+    <div onClick={onClose} style={{position:'fixed',inset:0,zIndex:100,background:'rgba(26,26,46,0.55)',display:'flex',alignItems:'flex-end',justifyContent:'center'}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:C.white,borderRadius:'20px 20px 0 0',padding:`24px 20px calc(28px + env(safe-area-inset-bottom))`,width:'100%',maxWidth:480,animation:'slideUp .28s ease'}}>
+        <div style={{width:36,height:4,borderRadius:2,background:C.border,margin:'0 auto 18px'}}/>
+        <div style={{fontSize:18,fontWeight:700,color:C.text,marginBottom:4}}>Invite to Guess</div>
+        <div style={{fontSize:13,color:C.text3,marginBottom:16,lineHeight:1.5}}>Friends tap the link, record their fart, get scored — before they hear yours.</div>
+        <div style={{background:C.purpleBg,borderRadius:10,padding:'12px 14px',marginBottom:14,fontSize:13,color:C.text2,lineHeight:1.7,whiteSpace:'pre-line',wordBreak:'break-all',border:`1px solid ${C.purpleBorder}`}}>{msg}</div>
+        <button onClick={copy} style={{width:'100%',padding:14,borderRadius:12,border:'none',background:copied?C.green:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,color:'white',fontFamily:"'Open Sans',sans-serif",fontSize:15,fontWeight:700,cursor:'pointer',marginBottom:10,transition:'background .2s'}}>
+          {copied?'✓ Copied!':'Copy Invite Link'}
+        </button>
+        {navigator.share&&<button onClick={()=>navigator.share({text:msg}).catch(()=>{})} style={{width:'100%',padding:14,borderRadius:12,border:`1.5px solid ${C.purpleBorder}`,background:'white',fontFamily:"'Open Sans',sans-serif",fontSize:15,fontWeight:600,color:C.purple,cursor:'pointer'}}>Share via…</button>}
+      </div>
+    </div>
+  );
+}
+
 function useRecorder(){
   const [recording,setRecording]=useState(false);
   const [secs,setSecs]=useState(0);
   const [blob,setBlob]=useState(null);
-  const [audioUrl,setAudioUrl]=useState(null);
   const [audioBuffer,setAudioBuffer]=useState(null);
   const mr=useRef(null), chunks=useRef([]), timer=useRef(null);
 
@@ -198,7 +277,6 @@ function useRecorder(){
         stream.getTracks().forEach(t=>t.stop());
         const b=new Blob(chunks.current,{type:'audio/webm'});
         setBlob(b);
-        setAudioUrl(URL.createObjectURL(b));
         try{
           const ab=await b.arrayBuffer();
           const ctx=new(window.AudioContext||window.webkitAudioContext)();
@@ -207,13 +285,13 @@ function useRecorder(){
       };
       rec.start(100); setRecording(true); setSecs(0);
       timer.current=setInterval(()=>setSecs(s=>s+1),1000);
-    }catch(e){ alert('Microphone access required. Please allow it in your browser settings.'); }
+    }catch(e){ alert('Microphone access required. Please allow it in your browser settings and refresh.'); }
   },[]);
 
   const stop=useCallback(()=>{ clearInterval(timer.current); setRecording(false); if(mr.current&&mr.current.state!=='inactive') mr.current.stop(); },[]);
-  const reset=useCallback(()=>{ stop(); setBlob(null); setAudioUrl(null); setAudioBuffer(null); setSecs(0); },[stop]);
+  const reset=useCallback(()=>{ stop(); setBlob(null); setAudioBuffer(null); setSecs(0); },[stop]);
   const toggle=useCallback(()=>{ recording?stop():start(); },[recording,start,stop]);
-  return{recording,secs,blob,audioUrl,audioBuffer,toggle,reset};
+  return{recording,secs,blob,audioBuffer,toggle,reset};
 }
 
 // ════════════ LIST SCREEN ════════════
@@ -222,37 +300,34 @@ function ListScreen({submissions,loading,onOpen,onSubmitNew}){
   return(
     <div style={{display:'flex',flexDirection:'column',height:'100%',background:C.bg}}>
       <NavBar title=""/>
-      <div style={{flex:1,overflowY:'auto',WebkitOverflowScrolling:'touch',paddingBottom:160}}>
-        <div style={{padding:'6px 20px 20px'}}>
-          <div style={{fontSize:34,fontWeight:700,color:C.text,letterSpacing:'-0.025em',lineHeight:1.1}}>All Farts</div>
+      <div style={{flex:1,overflowY:'auto',WebkitOverflowScrolling:'touch',paddingBottom:'calc(140px + env(safe-area-inset-bottom))'}}>
+        <div style={{padding:'8px 20px 16px'}}>
+          <div style={{fontSize:32,fontWeight:700,color:C.text,letterSpacing:'-0.025em',lineHeight:1.1}}>All Farts</div>
         </div>
-
         {loading&&<div style={{display:'flex',justifyContent:'center',padding:'48px 0'}}><Spinner/></div>}
-
         {!loading&&submissions.length===0&&(
           <div style={{padding:'40px 20px',textAlign:'center'}}>
-            <div style={{fontSize:18,fontWeight:600,color:C.text,marginBottom:8}}>No farts yet.</div>
-            <div style={{fontSize:14,color:C.text3,lineHeight:1.5}}>Tap below to record the first one.</div>
+            <div style={{fontSize:17,fontWeight:600,color:C.text,marginBottom:8}}>No farts yet.</div>
+            <div style={{fontSize:14,color:C.text3,lineHeight:1.5}}>Tap the button below to record the first one.</div>
           </div>
         )}
-
         {!loading&&submissions.length>0&&(
-          <div style={{padding:'0 20px',marginBottom:24}}>
-            <div style={{fontSize:12,fontWeight:600,color:C.text3,letterSpacing:'0.07em',textTransform:'uppercase',marginBottom:10,paddingLeft:2}}>Recordings</div>
+          <div style={{padding:'0 16px',marginBottom:20}}>
+            <div style={{fontSize:11,fontWeight:600,color:C.text3,letterSpacing:'0.07em',textTransform:'uppercase',marginBottom:8,paddingLeft:4}}>Recordings</div>
             <div style={{background:C.white,borderRadius:14,overflow:'hidden',boxShadow:'0 2px 12px rgba(123,94,167,0.07)'}}>
               {submissions.map((sub,i)=>(
                 <div key={sub.id} style={{display:'flex',alignItems:'center',borderBottom:i<submissions.length-1?`1px solid ${C.border}`:'none'}}>
-                  <div onClick={()=>onOpen(sub)} style={{flex:1,display:'flex',alignItems:'center',padding:'14px 16px',gap:12,cursor:'pointer',WebkitTapHighlightColor:'transparent'}}>
+                  <div onClick={()=>onOpen(sub)} style={{flex:1,display:'flex',alignItems:'center',padding:'13px 14px',gap:10,cursor:'pointer',WebkitTapHighlightColor:'transparent',minWidth:0}}>
                     <MiniWave buffer={sub.audioBuffer}/>
                     <div style={{flex:1,minWidth:0}}>
                       <div style={{fontSize:15,fontWeight:600,color:C.text,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',marginBottom:2}}>{sub.name}</div>
                       <div style={{fontSize:12,color:C.text3}}>{formatDate(sub.date)} · {sub.guessCount} guess{sub.guessCount!==1?'es':''}</div>
                     </div>
-                    <div style={{fontSize:13,color:C.text3,flexShrink:0,marginRight:6}}>{fmt(sub.duration)}</div>
-                    <svg width="8" height="13" viewBox="0 0 8 13" fill="none" style={{flexShrink:0}}><path d="M1.5 1.5L6.5 6.5L1.5 11.5" stroke={C.text4} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>
+                    <div style={{fontSize:12,color:C.text3,flexShrink:0,marginRight:4}}>{fmt(sub.duration)}</div>
+                    <svg width="7" height="12" viewBox="0 0 8 13" fill="none" style={{flexShrink:0}}><path d="M1.5 1.5L6.5 6.5L1.5 11.5" stroke={C.text4} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>
                   </div>
-                  <button onClick={e=>{e.stopPropagation();setShareTarget(sub);}} style={{width:44,height:44,display:'flex',alignItems:'center',justifyContent:'center',background:'none',border:'none',cursor:'pointer',marginRight:8,flexShrink:0,WebkitTapHighlightColor:'transparent'}}>
-                    <svg width="18" height="20" viewBox="0 0 18 20" fill="none">
+                  <button onClick={e=>{e.stopPropagation();setShareTarget(sub);}} style={{width:42,height:42,display:'flex',alignItems:'center',justifyContent:'center',background:'none',border:'none',cursor:'pointer',marginRight:6,flexShrink:0,WebkitTapHighlightColor:'transparent'}}>
+                    <svg width="17" height="19" viewBox="0 0 18 20" fill="none">
                       <path d="M12 4L9 1M9 1L6 4M9 1V13" stroke={C.purple} strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
                       <path d="M3 9H2C1.44772 9 1 9.44772 1 10V18C1 18.5523 1.44772 19 2 19H16C16.5523 19 17 18.5523 17 18V10C17 9.44772 16.5523 9 16 9H15" stroke={C.purple} strokeWidth="1.8" strokeLinecap="round"/>
                     </svg>
@@ -263,15 +338,13 @@ function ListScreen({submissions,loading,onOpen,onSubmitNew}){
           </div>
         )}
       </div>
-
-      {/* Pinned bottom bar */}
-      <div style={{flexShrink:0,background:'rgba(245,243,250,0.96)',backdropFilter:'blur(20px)',borderTop:`1px solid ${C.purpleBorder}`,display:'flex',flexDirection:'column',alignItems:'center',paddingTop:16,paddingBottom:'calc(28px + env(safe-area-inset-bottom))',gap:8}}>
-        <button onClick={onSubmitNew} style={{width:88,height:88,borderRadius:'50%',border:`3.5px solid ${C.purple}`,background:C.white,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',padding:0,WebkitTapHighlightColor:'transparent',boxShadow:`0 6px 28px rgba(123,94,167,0.28)`}}>
-          <div style={{width:64,height:64,borderRadius:'50%',background:C.purple}}/>
+      {/* Pinned bottom */}
+      <div style={{position:'absolute',bottom:0,left:0,right:0,background:'rgba(245,243,250,0.97)',backdropFilter:'blur(20px)',WebkitBackdropFilter:'blur(20px)',borderTop:`1px solid ${C.purpleBorder}`,display:'flex',flexDirection:'column',alignItems:'center',paddingTop:14,paddingBottom:`calc(24px + env(safe-area-inset-bottom))`,gap:7}}>
+        <button onClick={onSubmitNew} style={{width:84,height:84,borderRadius:'50%',border:`3.5px solid ${C.purple}`,background:C.white,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',padding:0,WebkitTapHighlightColor:'transparent',boxShadow:`0 6px 24px rgba(123,94,167,0.28)`}}>
+          <div style={{width:62,height:62,borderRadius:'50%',background:C.purple}}/>
         </button>
-        <div style={{fontSize:12,color:C.text3,fontWeight:500,letterSpacing:'0.01em'}}>Submit a Fart</div>
+        <div style={{fontSize:12,color:C.text3,fontWeight:500}}>Submit a Fart</div>
       </div>
-
       {shareTarget&&<ShareModal sub={shareTarget} onClose={()=>setShareTarget(null)}/>}
     </div>
   );
@@ -281,67 +354,87 @@ function ListScreen({submissions,loading,onOpen,onSubmitNew}){
 function RecordScreen({onBack,onSave}){
   const rec=useRecorder();
   const [saving,setSaving]=useState(false);
+  const [fartName,setFartName]=useState('');
+  const [step,setStep]=useState('record'); // record | name
   const bars=Array.from({length:9});
 
+  const goToName=()=>{ if(rec.audioBuffer&&!rec.recording) setStep('name'); };
+
   const handleSave=async()=>{
-    if(!rec.blob||!rec.audioBuffer)return;
+    if(!rec.blob||!rec.audioBuffer||!fartName.trim())return;
     setSaving(true);
     try{
       const filename=`farts/${Date.now()}.webm`;
-      const audioUrl=await uploadAudio(rec.blob, filename);
-      const now=new Date();
+      const audioUrl=await uploadAudio(rec.blob,filename);
       const {data,error}=await sb.from('farts').insert({
-        name: formatDate(now),
-        duration: rec.audioBuffer.duration,
-        audio_url: audioUrl,
+        name:fartName.trim(),
+        duration:rec.audioBuffer.duration,
+        audio_url:audioUrl,
       }).select().single();
       if(error)throw error;
-      onSave({
-        id:data.id, name:data.name, date:new Date(data.created_at),
-        duration:data.duration, audioUrl:data.audio_url,
-        audioBuffer:rec.audioBuffer, guessCount:0,
-      });
-    }catch(e){
-      console.error(e);
-      alert('Failed to save. Please try again.');
-    }
+      onSave({id:data.id,name:data.name,date:new Date(data.created_at),duration:data.duration,audioUrl:data.audio_url,audioBuffer:rec.audioBuffer,guessCount:0});
+    }catch(e){console.error(e);alert('Failed to save. Check your connection and try again.');}
     setSaving(false);
   };
+
+  // Step 2: name the fart
+  if(step==='name'){
+    return(
+      <div style={{display:'flex',flexDirection:'column',height:'100%',background:C.white}}>
+        <NavBar title="Name Your Fart" onBack={()=>setStep('record')}/>
+        <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'24px 24px',gap:16}}>
+          <div style={{fontSize:20,fontWeight:700,color:C.text,letterSpacing:'-0.02em',textAlign:'center'}}>Give it a name.</div>
+          <div style={{fontSize:14,color:C.text3,textAlign:'center',lineHeight:1.5}}>This is what your friends will see in the list.</div>
+          <input
+            value={fartName}
+            onChange={e=>setFartName(e.target.value)}
+            onKeyDown={e=>e.key==='Enter'&&fartName.trim()&&handleSave()}
+            placeholder="e.g. The Classic, Post-Burrito..."
+            autoFocus
+            style={{width:'100%',padding:'14px 16px',borderRadius:12,border:`1.5px solid ${C.purpleBorder}`,fontSize:16,fontFamily:"'Open Sans',sans-serif",outline:'none',background:C.purpleBg,color:C.text,WebkitAppearance:'none'}}
+          />
+          <button onClick={handleSave} disabled={!fartName.trim()||saving} style={{width:'100%',padding:15,borderRadius:12,border:'none',background:(!fartName.trim()||saving)?`rgba(123,94,167,0.4)`:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,color:'white',fontFamily:"'Open Sans',sans-serif",fontSize:16,fontWeight:700,cursor:(!fartName.trim()||saving)?'not-allowed':'pointer',display:'flex',alignItems:'center',justifyContent:'center',gap:8,boxShadow:`0 4px 16px rgba(123,94,167,0.25)`}}>
+            {saving&&<Spinner white/>}{saving?'Saving…':'Save & Share'}
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return(
     <div style={{display:'flex',flexDirection:'column',height:'100%',background:C.white}}>
       <NavBar title="New Fart" onBack={()=>{rec.reset();onBack();}}/>
-      <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'32px 30px'}}>
+      <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'24px 28px'}}>
         {rec.recording&&(
-          <div style={{display:'flex',gap:5,height:56,alignItems:'flex-end',marginBottom:36}}>
+          <div style={{display:'flex',gap:5,height:52,alignItems:'flex-end',marginBottom:32}}>
             {bars.map((_,i)=><div key={i} style={{width:5,background:C.purple,borderRadius:3,opacity:.7,animation:`barPulse 1.2s ease-in-out ${i*.13}s infinite`}}/>)}
           </div>
         )}
         {!rec.recording&&rec.audioBuffer&&(
-          <div style={{width:'100%',marginBottom:28}}>
-            <BigWave buffer={rec.audioBuffer} height={80}/>
-            <div style={{display:'flex',justifyContent:'space-between',marginTop:8}}>
+          <div style={{width:'100%',marginBottom:24}}>
+            <BigWave buffer={rec.audioBuffer} height={72}/>
+            <div style={{display:'flex',justifyContent:'space-between',marginTop:6}}>
               <span style={{fontSize:12,color:C.text3}}>0:00</span>
               <span style={{fontSize:12,color:C.text3}}>{fmt(rec.audioBuffer.duration)}</span>
             </div>
           </div>
         )}
-        {!rec.recording&&!rec.audioBuffer&&<div style={{height:80,marginBottom:28}}/>}
-        <div style={{display:'flex',alignItems:'center',gap:8,background:C.purpleBg,borderRadius:100,padding:'9px 20px',marginBottom:60,border:`1px solid ${C.purpleBorder}`}}>
-          {rec.recording&&<div style={{width:8,height:8,borderRadius:'50%',background:C.purple,animation:'blink 1s step-end infinite'}}/>}
-          <div style={{fontSize:16,fontWeight:600,color:C.text,fontVariantNumeric:'tabular-nums',letterSpacing:'0.05em'}}>{fmt(rec.secs)}</div>
+        {!rec.recording&&!rec.audioBuffer&&<div style={{height:72,marginBottom:24}}/>}
+        <div style={{display:'flex',alignItems:'center',gap:8,background:C.purpleBg,borderRadius:100,padding:'8px 18px',marginBottom:48,border:`1px solid ${C.purpleBorder}`}}>
+          {rec.recording&&<div style={{width:7,height:7,borderRadius:'50%',background:C.purple,animation:'blink 1s step-end infinite'}}/>}
+          <div style={{fontSize:15,fontWeight:600,color:C.text,fontVariantNumeric:'tabular-nums',letterSpacing:'0.05em'}}>{fmt(rec.secs)}</div>
         </div>
       </div>
-      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 40px',paddingBottom:'calc(48px + env(safe-area-inset-bottom))'}}>
-        <button onClick={rec.reset} style={{width:52,height:52,borderRadius:'50%',background:C.purpleBg,border:`1px solid ${C.purpleBorder}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',opacity:(rec.recording||rec.audioBuffer)?1:0,pointerEvents:(rec.recording||rec.audioBuffer)?'auto':'none',transition:'opacity .2s',WebkitTapHighlightColor:'transparent'}}>
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1 1L13 13M13 1L1 13" stroke={C.purple} strokeWidth="1.8" strokeLinecap="round"/></svg>
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 36px',paddingBottom:`calc(40px + env(safe-area-inset-bottom))`}}>
+        <button onClick={rec.reset} style={{width:50,height:50,borderRadius:'50%',background:C.purpleBg,border:`1px solid ${C.purpleBorder}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',opacity:(rec.recording||rec.audioBuffer)?1:0,pointerEvents:(rec.recording||rec.audioBuffer)?'auto':'none',WebkitTapHighlightColor:'transparent'}}>
+          <svg width="13" height="13" viewBox="0 0 14 14" fill="none"><path d="M1 1L13 13M13 1L1 13" stroke={C.purple} strokeWidth="1.8" strokeLinecap="round"/></svg>
         </button>
-        <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:12}}>
+        <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:10}}>
           <RecordButton recording={rec.recording} onToggle={rec.toggle} size="large"/>
           <div style={{fontSize:13,color:C.text3,fontWeight:500}}>{rec.recording?'Tap to stop':rec.audioBuffer?'Tap to re-record':'Tap to record'}</div>
         </div>
-        <button onClick={handleSave} disabled={saving||!rec.audioBuffer||rec.recording} style={{width:52,height:52,borderRadius:'50%',background:C.purple,border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',opacity:(!rec.recording&&rec.audioBuffer)?1:0,pointerEvents:(!rec.recording&&rec.audioBuffer)?'auto':'none',transition:'opacity .2s',WebkitTapHighlightColor:'transparent',boxShadow:`0 4px 16px rgba(123,94,167,0.35)`}}>
-          {saving?<Spinner white/>:<svg width="18" height="14" viewBox="0 0 18 14" fill="none"><path d="M1.5 7L6.5 12L16.5 1.5" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+        <button onClick={goToName} style={{width:50,height:50,borderRadius:'50%',background:C.purple,border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',opacity:(!rec.recording&&rec.audioBuffer)?1:0,pointerEvents:(!rec.recording&&rec.audioBuffer)?'auto':'none',WebkitTapHighlightColor:'transparent',boxShadow:`0 4px 14px rgba(123,94,167,0.35)`}}>
+          <svg width="16" height="13" viewBox="0 0 18 14" fill="none"><path d="M1.5 7L6.5 12L16.5 1.5" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/></svg>
         </button>
       </div>
     </div>
@@ -351,70 +444,46 @@ function RecordScreen({onBack,onSave}){
 // ════════════ DETAIL SCREEN ════════════
 function DetailScreen({sub,onBack,onGuessAdded,isOwner}){
   const [unlocked,setUnlocked]=useState(!!isOwner);
-  const [playing,setPlaying]=useState(false);
   const [analysing,setAnalysing]=useState(false);
   const [myResult,setMyResult]=useState(null);
   const [guesses,setGuesses]=useState([]);
   const [shareOpen,setShareOpen]=useState(false);
   const [guestName,setGuestName]=useState('');
   const [nameSet,setNameSet]=useState(!!isOwner);
+  const [subBuf,setSubBuf]=useState(sub.audioBuffer||null);
   const [loadingAudio,setLoadingAudio]=useState(!sub.audioBuffer);
-  const [subAudioBuffer,setSubAudioBuffer]=useState(sub.audioBuffer||null);
-  const audioRef=useRef(null);
   const rec=useRecorder();
 
-  // Load audio buffer from URL if not already loaded
   useEffect(()=>{
-    if(!subAudioBuffer&&sub.audioUrl){
+    if(!subBuf&&sub.audioUrl){
       setLoadingAudio(true);
-      urlToAudioBuffer(sub.audioUrl)
-        .then(buf=>{setSubAudioBuffer(buf);setLoadingAudio(false);})
-        .catch(()=>setLoadingAudio(false));
+      urlToAudioBuffer(sub.audioUrl).then(b=>{setSubBuf(b);setLoadingAudio(false);}).catch(()=>setLoadingAudio(false));
     }
-    if(sub.audioUrl){
-      audioRef.current=new Audio(sub.audioUrl);
-      audioRef.current.onended=()=>setPlaying(false);
-    }
-    // Load guesses
     sb.from('guesses').select('*').eq('fart_id',sub.id).order('score',{ascending:false})
-      .then(({data})=>{
-        if(data) setGuesses(data.map(g=>({...g,name:g.guesser_name})));
-      });
-    return()=>{ if(audioRef.current) audioRef.current.pause(); rec.reset(); };
+      .then(({data})=>{ if(data) setGuesses(data.map(g=>({...g,name:g.guesser_name}))); });
+    return()=>rec.reset();
   },[sub.id]);
 
-  const togglePlay=()=>{
-    if(!audioRef.current)return;
-    if(playing){audioRef.current.pause();audioRef.current.currentTime=0;setPlaying(false);}
-    else{audioRef.current.currentTime=0;audioRef.current.play().catch(()=>{});setPlaying(true);}
-  };
-
   const analyse=async()=>{
-    if(!rec.blob||!rec.audioBuffer||!subAudioBuffer)return;
+    if(!rec.blob||!rec.audioBuffer||!subBuf)return;
     setAnalysing(true);
-    const score=compareAudio(subAudioBuffer,rec.audioBuffer);
+    const score=compareAudio(subBuf,rec.audioBuffer);
     let text=`Match score: ${score}%.`;
     try{
-      const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:200,messages:[{role:'user',content:`Fart acoustics analyst. Match: ${score}%. 2 dry sentences. No exclamation marks, no emoji.`}]})});
+      const res=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:180,messages:[{role:'user',content:`Fart acoustics analyst. This person scored ${score}/100 matching a fart. Under 50 is poor, 50-70 is decent, 70-85 is good, 85+ is excellent. Write exactly 1 dry sentence judging their performance. No emoji, no exclamation marks.`}]})});
       const d=await res.json(); text=d.content?.[0]?.text||text;
     }catch(e){}
-
-    // Upload guess audio + save to DB
     try{
       const filename=`guesses/${Date.now()}.webm`;
-      const guessAudioUrl=await uploadAudio(rec.blob, filename);
-      const {data}=await sb.from('guesses').insert({
-        fart_id:sub.id, guesser_name:guestName||'Guest',
-        score, analysis:text, audio_url:guessAudioUrl,
-      }).select().single();
+      const guessUrl=await uploadAudio(rec.blob,filename);
+      const {data}=await sb.from('guesses').insert({fart_id:sub.id,guesser_name:guestName||'Guest',score,analysis:text,audio_url:guessUrl}).select().single();
       if(data){
-        const ng={...data,name:data.guesser_name,audioUrl:data.audio_url};
+        const ng={...data,name:data.guesser_name};
         const updated=[...guesses,ng].sort((a,b)=>b.score-a.score);
         setGuesses(updated);
         onGuessAdded(sub.id,updated.length);
       }
-    }catch(e){console.error('Failed to save guess',e);}
-
+    }catch(e){console.error(e);}
     setMyResult({score,analysis:text});
     setAnalysing(false);
     setUnlocked(true);
@@ -423,20 +492,20 @@ function DetailScreen({sub,onBack,onGuessAdded,isOwner}){
 
   if(!sub)return null;
 
-  // ── Name entry ──
+  // Name entry
   if(!nameSet){
     return(
       <div style={{display:'flex',flexDirection:'column',height:'100%',background:C.white}}>
         <NavBar title={sub.name} onBack={()=>{rec.reset();onBack();}}/>
-        <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'32px 24px',gap:16}}>
-          <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:'-0.02em',textAlign:'center'}}>What's your name?</div>
-          <div style={{fontSize:14,color:C.text3,textAlign:'center',lineHeight:1.5}}>It'll appear on the leaderboard.</div>
+        <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'24px',gap:14}}>
+          <div style={{fontSize:20,fontWeight:700,color:C.text,letterSpacing:'-0.02em',textAlign:'center'}}>What's your name?</div>
+          <div style={{fontSize:14,color:C.text3,textAlign:'center',lineHeight:1.5}}>It'll show on the leaderboard.</div>
           <input value={guestName} onChange={e=>setGuestName(e.target.value)}
             onKeyDown={e=>e.key==='Enter'&&guestName.trim()&&setNameSet(true)}
-            placeholder="Enter your name"
-            style={{width:'100%',maxWidth:320,padding:'14px 16px',borderRadius:12,border:`1.5px solid ${C.purpleBorder}`,fontSize:16,fontFamily:"'Open Sans',sans-serif",outline:'none',textAlign:'center',background:C.purpleBg,color:C.text}}
+            placeholder="Your name" autoFocus
+            style={{width:'100%',padding:'14px 16px',borderRadius:12,border:`1.5px solid ${C.purpleBorder}`,fontSize:16,fontFamily:"'Open Sans',sans-serif",outline:'none',background:C.purpleBg,color:C.text,WebkitAppearance:'none'}}
           />
-          <button onClick={()=>guestName.trim()&&setNameSet(true)} style={{width:'100%',maxWidth:320,padding:14,borderRadius:12,border:'none',background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,color:'white',fontFamily:"'Open Sans',sans-serif",fontSize:16,fontWeight:700,cursor:'pointer',boxShadow:`0 4px 16px rgba(123,94,167,0.3)`}}>
+          <button onClick={()=>guestName.trim()&&setNameSet(true)} style={{width:'100%',padding:14,borderRadius:12,border:'none',background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,color:'white',fontFamily:"'Open Sans',sans-serif",fontSize:16,fontWeight:700,cursor:'pointer',boxShadow:`0 4px 14px rgba(123,94,167,0.28)`}}>
             Continue
           </button>
         </div>
@@ -444,42 +513,42 @@ function DetailScreen({sub,onBack,onGuessAdded,isOwner}){
     );
   }
 
-  // ── LOCKED ──
+  // Locked
   if(!unlocked)return(
     <div style={{display:'flex',flexDirection:'column',height:'100%',background:C.white}}>
       <NavBar title={sub.name} onBack={()=>{rec.reset();onBack();}}/>
-      <div style={{flex:1,overflowY:'auto',WebkitOverflowScrolling:'touch'}}>
-        <div style={{padding:'24px 20px',borderBottom:`1px solid ${C.border}`}}>
-          <div style={{fontSize:12,color:C.text3,marginBottom:16,fontWeight:500}}>{formatDate(sub.date)} · {fmt(sub.duration)}</div>
-          <div style={{position:'relative',marginBottom:16,borderRadius:10,overflow:'hidden'}}>
+      <div style={{flex:1,overflowY:'auto',WebkitOverflowScrolling:'touch',paddingBottom:20}}>
+        <div style={{padding:'20px 16px',borderBottom:`1px solid ${C.border}`}}>
+          <div style={{fontSize:12,color:C.text3,marginBottom:14,fontWeight:500}}>{formatDate(sub.date)} · {fmt(sub.duration)}</div>
+          <div style={{position:'relative',marginBottom:14,borderRadius:10,overflow:'hidden'}}>
             {loadingAudio
-              ?<div style={{height:64,background:C.purpleBg,borderRadius:10,display:'flex',alignItems:'center',justifyContent:'center'}}><Spinner/></div>
-              :<BigWave buffer={subAudioBuffer} height={64} color="rgba(123,94,167,0.15)"/>
+              ?<div style={{height:60,background:C.purpleBg,borderRadius:10,display:'flex',alignItems:'center',justifyContent:'center'}}><Spinner/></div>
+              :<BigWave buffer={subBuf} height={60} color="rgba(123,94,167,0.15)"/>
             }
-            <div style={{position:'absolute',inset:0,backdropFilter:'blur(6px)',background:'rgba(243,240,249,0.75)',display:'flex',alignItems:'center',justifyContent:'center',gap:10,borderRadius:10}}>
-              <svg width="18" height="22" viewBox="0 0 18 22" fill="none"><rect x="1" y="9" width="16" height="12" rx="3" stroke={C.purple} strokeWidth="1.8"/><path d="M5 9V6a4 4 0 018 0v3" stroke={C.purple} strokeWidth="1.8" strokeLinecap="round"/></svg>
+            <div style={{position:'absolute',inset:0,backdropFilter:'blur(6px)',WebkitBackdropFilter:'blur(6px)',background:'rgba(243,240,249,0.75)',display:'flex',alignItems:'center',justifyContent:'center',gap:8,borderRadius:10}}>
+              <svg width="16" height="20" viewBox="0 0 18 22" fill="none"><rect x="1" y="9" width="16" height="12" rx="3" stroke={C.purple} strokeWidth="1.8"/><path d="M5 9V6a4 4 0 018 0v3" stroke={C.purple} strokeWidth="1.8" strokeLinecap="round"/></svg>
               <span style={{fontSize:13,fontWeight:600,color:C.purple}}>Guess first to unlock</span>
             </div>
           </div>
-          <div style={{display:'flex',alignItems:'center',gap:14,opacity:.3,pointerEvents:'none'}}>
-            <div style={{width:44,height:44,borderRadius:'50%',background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,display:'flex',alignItems:'center',justifyContent:'center'}}>
-              <svg width="14" height="16" viewBox="0 0 14 16" fill="none"><path d="M2 1.5L13 8L2 14.5V1.5Z" fill="white"/></svg>
+          <div style={{display:'flex',alignItems:'center',gap:12,opacity:.3,pointerEvents:'none'}}>
+            <div style={{width:42,height:42,borderRadius:'50%',background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,display:'flex',alignItems:'center',justifyContent:'center'}}>
+              <svg width="13" height="15" viewBox="0 0 14 16" fill="none"><path d="M2 1.5L13 8L2 14.5V1.5Z" fill="white"/></svg>
             </div>
             <div style={{fontSize:14,color:C.text3}}>Locked until you guess</div>
           </div>
         </div>
-        <div style={{padding:'24px 20px 40px'}}>
-          <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:'-0.02em',marginBottom:4}}>Your Guess</div>
-          <div style={{fontSize:14,color:C.text3,marginBottom:24,lineHeight:1.5}}>Record your fart. You'll hear the original after you submit.</div>
-          <div style={{background:C.purpleBg,borderRadius:14,padding:'28px 24px',display:'flex',flexDirection:'column',alignItems:'center',gap:16,border:`1px solid ${C.purpleBorder}`}}>
+        <div style={{padding:'20px 16px 32px'}}>
+          <div style={{fontSize:20,fontWeight:700,color:C.text,letterSpacing:'-0.02em',marginBottom:4}}>Your Guess</div>
+          <div style={{fontSize:13,color:C.text3,marginBottom:20,lineHeight:1.5}}>Record your fart. You'll hear the original after you submit.</div>
+          <div style={{background:C.purpleBg,borderRadius:14,padding:'24px 20px',display:'flex',flexDirection:'column',alignItems:'center',gap:14,border:`1px solid ${C.purpleBorder}`}}>
             <div style={{fontSize:13,color:C.text3,textAlign:'center'}}>{rec.audioBuffer?'Tap to re-record.':'Record your fart below.'}</div>
-            <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:10}}>
+            <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:8}}>
               <RecordButton recording={rec.recording} onToggle={rec.toggle} size="small"/>
               <div style={{fontSize:12,color:C.text3}}>{rec.recording?`Recording · ${fmt(rec.secs)}`:rec.audioBuffer?'Tap to re-record':'Tap to record'}</div>
             </div>
-            {rec.audioBuffer&&!rec.recording&&<div style={{width:'100%'}}><BigWave buffer={rec.audioBuffer} height={40} color={C.purpleLight}/></div>}
+            {rec.audioBuffer&&!rec.recording&&<div style={{width:'100%'}}><BigWave buffer={rec.audioBuffer} height={36} color={C.purpleLight}/></div>}
             {rec.audioBuffer&&!rec.recording&&(
-              <button onClick={analyse} disabled={analysing} style={{width:'100%',padding:14,borderRadius:12,border:'none',background:analysing?`rgba(123,94,167,0.5)`:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,color:'white',fontFamily:"'Open Sans',sans-serif",fontSize:15,fontWeight:700,cursor:analysing?'not-allowed':'pointer',display:'flex',alignItems:'center',justifyContent:'center',gap:8,boxShadow:analysing?'none':`0 4px 16px rgba(123,94,167,0.3)`}}>
+              <button onClick={analyse} disabled={analysing} style={{width:'100%',padding:14,borderRadius:12,border:'none',background:analysing?`rgba(123,94,167,0.5)`:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,color:'white',fontFamily:"'Open Sans',sans-serif",fontSize:15,fontWeight:700,cursor:analysing?'not-allowed':'pointer',display:'flex',alignItems:'center',justifyContent:'center',gap:8,boxShadow:analysing?'none':`0 4px 14px rgba(123,94,167,0.28)`}}>
                 {analysing&&<Spinner white/>}{analysing?'Analysing…':'Submit & Reveal'}
               </button>
             )}
@@ -489,50 +558,47 @@ function DetailScreen({sub,onBack,onGuessAdded,isOwner}){
     </div>
   );
 
-  // ── UNLOCKED ──
+  // Unlocked
   return(
     <div style={{display:'flex',flexDirection:'column',height:'100%',background:C.white}}>
-      <NavBar title={sub.name} onBack={()=>{if(audioRef.current)audioRef.current.pause();rec.reset();onBack();}}
-        rightSlot={<button onClick={()=>setShareOpen(true)} style={{background:'none',border:'none',color:C.purple,cursor:'pointer',fontSize:14,fontWeight:600,fontFamily:"'Open Sans',sans-serif"}}>Share</button>}
+      <NavBar title={sub.name} onBack={()=>{rec.reset();onBack();}}
+        rightSlot={<button onClick={()=>setShareOpen(true)} style={{background:'none',border:'none',color:C.purple,cursor:'pointer',fontSize:14,fontWeight:600,fontFamily:"'Open Sans',sans-serif",WebkitTapHighlightColor:'transparent'}}>Share</button>}
       />
-      <div style={{flex:1,overflowY:'auto',WebkitOverflowScrolling:'touch'}}>
+      <div style={{flex:1,overflowY:'auto',WebkitOverflowScrolling:'touch',paddingBottom:20}}>
         {myResult&&(
-          <div style={{background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,padding:'24px 20px'}}>
-            <div style={{fontSize:12,fontWeight:600,color:'rgba(255,255,255,0.7)',letterSpacing:'0.08em',textTransform:'uppercase',marginBottom:6}}>Your Score</div>
-            <div style={{fontSize:56,fontWeight:700,color:'white',letterSpacing:'-0.03em',lineHeight:1}}>{myResult.score}<span style={{fontSize:24,fontWeight:500,opacity:.7}}>%</span></div>
-            {myResult.analysis&&<div style={{fontSize:13,color:'rgba(255,255,255,0.85)',marginTop:10,lineHeight:1.6}}>{myResult.analysis}</div>}
+          <div style={{background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,padding:'20px 16px'}}>
+            <div style={{fontSize:11,fontWeight:600,color:'rgba(255,255,255,0.7)',letterSpacing:'0.08em',textTransform:'uppercase',marginBottom:4}}>Your Score</div>
+            <div style={{fontSize:52,fontWeight:700,color:'white',letterSpacing:'-0.03em',lineHeight:1}}>{myResult.score}<span style={{fontSize:22,fontWeight:500,opacity:.7}}>%</span></div>
+            {myResult.analysis&&<div style={{fontSize:13,color:'rgba(255,255,255,0.85)',marginTop:8,lineHeight:1.6}}>{myResult.analysis}</div>}
           </div>
         )}
-        <div style={{padding:'24px 20px',borderBottom:`1px solid ${C.border}`}}>
-          {myResult&&<div style={{fontSize:13,fontWeight:600,color:C.text,marginBottom:14}}>Original — now revealed</div>}
-          {!myResult&&<div style={{fontSize:12,color:C.text3,marginBottom:16,fontWeight:500}}>{formatDate(sub.date)} · {fmt(sub.duration)}</div>}
+        <div style={{padding:'20px 16px',borderBottom:`1px solid ${C.border}`}}>
+          {myResult&&<div style={{fontSize:13,fontWeight:600,color:C.text,marginBottom:12}}>Original — now revealed</div>}
+          {!myResult&&<div style={{fontSize:12,color:C.text3,marginBottom:14,fontWeight:500}}>{formatDate(sub.date)} · {fmt(sub.duration)}</div>}
           {loadingAudio
-            ?<div style={{height:64,background:C.purpleBg,borderRadius:10,marginBottom:16,display:'flex',alignItems:'center',justifyContent:'center'}}><Spinner/></div>
-            :<div style={{marginBottom:16}}><BigWave buffer={subAudioBuffer} height={64}/></div>
+            ?<div style={{height:60,background:C.purpleBg,borderRadius:10,marginBottom:14,display:'flex',alignItems:'center',justifyContent:'center'}}><Spinner/></div>
+            :<div style={{marginBottom:14}}><BigWave buffer={subBuf} height={60}/></div>
           }
-          <div style={{display:'flex',alignItems:'center',gap:14}}>
-            <button onClick={togglePlay} style={{width:44,height:44,borderRadius:'50%',background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',color:'white',boxShadow:`0 4px 14px rgba(123,94,167,0.3)`}}>
-              {playing?<svg width="12" height="14" viewBox="0 0 12 14" fill="none"><rect x="1" y="1" width="3.5" height="12" rx="1" fill="white"/><rect x="7.5" y="1" width="3.5" height="12" rx="1" fill="white"/></svg>:<svg width="14" height="16" viewBox="0 0 14 16" fill="none"><path d="M2 1.5L13 8L2 14.5V1.5Z" fill="white"/></svg>}
-            </button>
-            <div style={{fontSize:14,color:C.text3}}>{playing?'Playing…':'Tap to play original'}</div>
-          </div>
+          <AudioPlayer url={sub.audioUrl} buffer={subBuf}/>
         </div>
-        <div style={{padding:'24px 20px 40px'}}>
-          <div style={{fontSize:22,fontWeight:700,color:C.text,letterSpacing:'-0.02em',marginBottom:4}}>Leaderboard</div>
-          <div style={{fontSize:14,color:C.text3,marginBottom:20}}>{guesses.length} guess{guesses.length!==1?'es':''} so far.</div>
+        <div style={{padding:'20px 16px 32px'}}>
+          <div style={{fontSize:20,fontWeight:700,color:C.text,letterSpacing:'-0.02em',marginBottom:4}}>Leaderboard</div>
+          <div style={{fontSize:13,color:C.text3,marginBottom:16}}>{guesses.length} guess{guesses.length!==1?'es':''} so far.</div>
           {guesses.length>0&&(
             <div style={{display:'flex',flexDirection:'column',gap:8}}>
               {guesses.map((g,i)=>(
-                <div key={g.id} style={{background:i===0?`linear-gradient(135deg,rgba(123,94,167,0.1),rgba(155,126,200,0.06))`:C.purpleBg,borderRadius:12,padding:'14px 16px',display:'flex',alignItems:'center',gap:10,border:i===0?`1.5px solid ${C.purpleBorder}`:`1px solid ${C.purpleBorder}`}}>
-                  <div style={{fontSize:13,fontWeight:700,color:i===0?C.purple:C.text3,width:20,textAlign:'center',flexShrink:0}}>{i+1}</div>
-                  {g.audio_url&&<button onClick={()=>{const a=new Audio(g.audio_url);a.play().catch(()=>{});}} style={{width:32,height:32,borderRadius:'50%',background:C.white,border:`1px solid ${C.purpleBorder}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',flexShrink:0}}>
-                    <svg width="9" height="11" viewBox="0 0 10 12" fill="none"><path d="M1 1L9 6L1 11V1Z" fill={C.purple}/></svg>
-                  </button>}
+                <div key={g.id} style={{background:i===0?`linear-gradient(135deg,rgba(123,94,167,0.1),rgba(155,126,200,0.06))`:C.purpleBg,borderRadius:12,padding:'12px 14px',display:'flex',alignItems:'center',gap:10,border:i===0?`1.5px solid ${C.purpleBorder}`:`1px solid ${C.purpleBorder}`}}>
+                  <div style={{fontSize:12,fontWeight:700,color:i===0?C.purple:C.text3,width:18,textAlign:'center',flexShrink:0}}>{i+1}</div>
+                  {g.audio_url&&(
+                    <button onClick={()=>{const a=new Audio(g.audio_url);a.crossOrigin='anonymous';a.play().catch(()=>{});}} style={{width:30,height:30,borderRadius:'50%',background:C.white,border:`1px solid ${C.purpleBorder}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',flexShrink:0,WebkitTapHighlightColor:'transparent'}}>
+                      <svg width="9" height="11" viewBox="0 0 10 12" fill="none"><path d="M1 1L9 6L1 11V1Z" fill={C.purple}/></svg>
+                    </button>
+                  )}
                   <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontSize:14,fontWeight:600,color:C.text}}>{g.name||g.guesser_name}</div>
-                    {g.analysis&&<div style={{fontSize:11,color:C.text3,marginTop:1,lineHeight:1.4}}>{g.analysis}</div>}
+                    <div style={{fontSize:14,fontWeight:600,color:C.text,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{g.name||g.guesser_name}</div>
+                    {g.analysis&&<div style={{fontSize:11,color:C.text3,marginTop:1,lineHeight:1.4,overflow:'hidden',display:'-webkit-box',WebkitLineClamp:2,WebkitBoxOrient:'vertical'}}>{g.analysis}</div>}
                   </div>
-                  <div style={{fontSize:18,fontWeight:700,color:i===0?C.purple:C.text,flexShrink:0}}>{g.score}%</div>
+                  <div style={{fontSize:17,fontWeight:700,color:i===0?C.purple:C.text,flexShrink:0,marginLeft:4}}>{g.score}%</div>
                 </div>
               ))}
             </div>
@@ -557,20 +623,11 @@ function App(){
       setLoading(true);
       const {data,error}=await sb.from('farts').select('*').order('created_at',{ascending:false});
       if(error){console.error(error);setLoading(false);return;}
-
-      // For each fart, get guess count
       const subs=await Promise.all((data||[]).map(async f=>{
         const {count}=await sb.from('guesses').select('*',{count:'exact',head:true}).eq('fart_id',f.id);
-        return{
-          id:f.id, name:f.name, date:new Date(f.created_at),
-          duration:f.duration, audioUrl:f.audio_url,
-          audioBuffer:null, // loaded on demand when opening detail
-          guessCount:count||0,
-        };
+        return{id:f.id,name:f.name,date:new Date(f.created_at),duration:f.duration,audioUrl:f.audio_url,audioBuffer:null,guessCount:count||0};
       }));
       setSubmissions(subs);
-
-      // Deep link: ?fart=UUID opens that fart directly
       const params=new URLSearchParams(window.location.search);
       const fartId=params.get('fart');
       if(fartId){
@@ -584,23 +641,13 @@ function App(){
 
   const navTo=s=>{setHist(h=>[...h,s]);setScreen(s);};
   const pop=()=>setHist(h=>{const n=h.slice(0,-1);setScreen(n[n.length-1]);return n;});
-
-  const slide=s=>({
-    position:'absolute',inset:0,
-    transform:screen===s?'translateX(0)':hist.indexOf(s)<hist.indexOf(screen)?'translateX(-28%)':'translateX(100%)',
-    transition:'transform .34s cubic-bezier(.4,0,.2,1)',
-    zIndex:screen===s?2:1,
-  });
-
-  // isOwner = you're on the list screen naturally (not via ?fart= invite link)
+  const slide=s=>({position:'absolute',inset:0,transform:screen===s?'translateX(0)':hist.indexOf(s)<hist.indexOf(screen)?'translateX(-28%)':'translateX(100%)',transition:'transform .34s cubic-bezier(.4,0,.2,1)',zIndex:screen===s?2:1});
   const isOwner=!new URLSearchParams(window.location.search).get('fart');
 
   return(
     <div style={{height:'100vh',overflow:'hidden',fontFamily:"'Open Sans',sans-serif",position:'relative',background:C.bg}}>
       <div style={slide('list')}>
-        <ListScreen submissions={submissions} loading={loading}
-          onOpen={sub=>{setActiveSub(sub);navTo('detail');}}
-          onSubmitNew={()=>navTo('record')}/>
+        <ListScreen submissions={submissions} loading={loading} onOpen={sub=>{setActiveSub(sub);navTo('detail');}} onSubmitNew={()=>navTo('record')}/>
       </div>
       <div style={slide('record')}>
         <RecordScreen onBack={pop} onSave={sub=>{setSubmissions(s=>[sub,...s]);pop();}}/>
@@ -608,9 +655,8 @@ function App(){
       <div style={slide('detail')}>
         {activeSub&&<DetailScreen
           sub={submissions.find(s=>s.id===activeSub.id)||activeSub}
-          onBack={pop}
-          isOwner={isOwner}
-          onGuessAdded={(id,newCount)=>setSubmissions(p=>p.map(s=>s.id===id?{...s,guessCount:newCount}:s))}
+          onBack={pop} isOwner={isOwner}
+          onGuessAdded={(id,c)=>setSubmissions(p=>p.map(s=>s.id===id?{...s,guessCount:c}:s))}
         />}
       </div>
     </div>
