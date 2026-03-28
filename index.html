@@ -36,12 +36,26 @@ const BUCKET = 'fart-audio';
 async function uploadAudio(blob, filename) {
   const {error} = await sb.storage.from(BUCKET).upload(filename, blob, {contentType:'audio/webm',upsert:true});
   if(error) throw error;
-  const {data} = sb.storage.from(BUCKET).getPublicUrl(filename);
-  return data.publicUrl;
+  // Store just the path, fetch signed URL on demand
+  return filename;
 }
 
-async function urlToAudioBuffer(url) {
-  const res = await fetch(url);
+// Get a fresh signed URL (valid 1 hour) — bypasses all CORS issues
+async function getSignedUrl(pathOrUrl) {
+  // If it's already a full URL (old records), extract path
+  let path = pathOrUrl;
+  if(pathOrUrl.startsWith('http')) {
+    const parts = pathOrUrl.split('/fart-audio/');
+    path = parts[1] || pathOrUrl;
+  }
+  const {data, error} = await sb.storage.from(BUCKET).createSignedUrl(path, 3600);
+  if(error || !data?.signedUrl) throw new Error('Could not get signed URL');
+  return data.signedUrl;
+}
+
+async function urlToAudioBuffer(pathOrUrl) {
+  const signedUrl = await getSignedUrl(pathOrUrl);
+  const res = await fetch(signedUrl);
   const ab = await res.arrayBuffer();
   const ctx = new (window.AudioContext||window.webkitAudioContext)();
   return await ctx.decodeAudioData(ab);
@@ -182,58 +196,71 @@ function NavBar({title,onBack,rightSlot}){
   );
 }
 
-// ── Audio Player Component ──
-function AudioPlayer({url, buffer, label="Tap to play"}){
-  const [state,setState]=useState('idle'); // idle | loading | playing | paused | error
+// ── Audio Player — uses signed URLs + blob cache for reliable playback ──
+const audioBlobCache = {};
+
+async function getPlayableUrl(pathOrUrl) {
+  if(!pathOrUrl) throw new Error('No URL');
+  if(audioBlobCache[pathOrUrl]) return audioBlobCache[pathOrUrl];
+  const signedUrl = await getSignedUrl(pathOrUrl);
+  const res = await fetch(signedUrl);
+  if(!res.ok) throw new Error(`HTTP ${res.status}`);
+  const blob = await res.blob();
+  const blobUrl = URL.createObjectURL(blob);
+  audioBlobCache[pathOrUrl] = blobUrl;
+  return blobUrl;
+}
+
+function AudioPlayer({url, label="Tap to play"}){
+  const [state,setState]=useState('idle');
   const audioRef=useRef(null);
 
   useEffect(()=>{
-    return()=>{ if(audioRef.current){audioRef.current.pause();audioRef.current.src='';} };
-  },[url]);
+    return()=>{
+      if(audioRef.current){ audioRef.current.pause(); audioRef.current.src=''; audioRef.current=null; }
+    };
+  },[]);
 
   const toggle=async()=>{
-    if(state==='loading')return;
+    if(state==='loading') return;
     if(state==='playing'){
       audioRef.current.pause();
       setState('paused');
       return;
     }
-    if(state==='paused'&&audioRef.current){
+    if(state==='paused' && audioRef.current){
       audioRef.current.play().catch(()=>setState('error'));
       setState('playing');
       return;
     }
-    // idle or error — create fresh
     setState('loading');
     try{
-      const audio=new Audio();
-      audio.crossOrigin='anonymous';
-      audioRef.current=audio;
-      audio.onended=()=>setState('idle');
-      audio.onerror=()=>setState('error');
-      audio.oncanplaythrough=()=>{
-        audio.play().then(()=>setState('playing')).catch(()=>setState('error'));
-      };
-      audio.src=url;
-      audio.load();
-    }catch(e){ setState('error'); }
+      const blobUrl = await getPlayableUrl(url);
+      const audio = new Audio(blobUrl);
+      audioRef.current = audio;
+      audio.onended = ()=>setState('idle');
+      audio.onerror = (e)=>{ console.error('Audio error',e); setState('error'); };
+      await audio.play();
+      setState('playing');
+    }catch(e){
+      console.error('Playback failed',e);
+      setState('error');
+    }
   };
 
   const icon = ()=>{
     if(state==='loading') return <Spinner white size={16}/>;
-    if(state==='playing') return(
-      <svg width="12" height="14" viewBox="0 0 12 14" fill="none"><rect x="1" y="1" width="3.5" height="12" rx="1" fill="white"/><rect x="7.5" y="1" width="3.5" height="12" rx="1" fill="white"/></svg>
-    );
+    if(state==='playing') return <svg width="12" height="14" viewBox="0 0 12 14" fill="none"><rect x="1" y="1" width="3.5" height="12" rx="1" fill="white"/><rect x="7.5" y="1" width="3.5" height="12" rx="1" fill="white"/></svg>;
     return <svg width="13" height="15" viewBox="0 0 14 16" fill="none"><path d="M2 1.5L13 8L2 14.5V1.5Z" fill="white"/></svg>;
   };
 
   return(
     <div style={{display:'flex',alignItems:'center',gap:12}}>
-      <button onClick={toggle} style={{width:44,height:44,borderRadius:'50%',background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:state==='loading'?'wait':'pointer',flexShrink:0,boxShadow:`0 3px 12px rgba(123,94,167,0.3)`,WebkitTapHighlightColor:'transparent'}}>
+      <button onClick={toggle} style={{width:44,height:44,borderRadius:'50%',background:`linear-gradient(135deg,${C.purple},${C.purpleLight})`,border:'none',display:'flex',alignItems:'center',justifyContent:'center',cursor:state==='loading'?'default':'pointer',flexShrink:0,boxShadow:`0 3px 12px rgba(123,94,167,0.3)`,WebkitTapHighlightColor:'transparent'}}>
         {icon()}
       </button>
-      <div style={{fontSize:14,color:C.text3}}>
-        {state==='playing'?'Playing…':state==='loading'?'Loading…':state==='error'?'Error loading audio':label}
+      <div style={{fontSize:14,color:state==='error'?'#ff3b30':C.text3}}>
+        {state==='playing'?'Playing…':state==='loading'?'Loading…':state==='error'?'Tap to retry':label}
       </div>
     </div>
   );
@@ -590,7 +617,13 @@ function DetailScreen({sub,onBack,onGuessAdded,isOwner}){
                 <div key={g.id} style={{background:i===0?`linear-gradient(135deg,rgba(123,94,167,0.1),rgba(155,126,200,0.06))`:C.purpleBg,borderRadius:12,padding:'12px 14px',display:'flex',alignItems:'center',gap:10,border:i===0?`1.5px solid ${C.purpleBorder}`:`1px solid ${C.purpleBorder}`}}>
                   <div style={{fontSize:12,fontWeight:700,color:i===0?C.purple:C.text3,width:18,textAlign:'center',flexShrink:0}}>{i+1}</div>
                   {g.audio_url&&(
-                    <button onClick={()=>{const a=new Audio(g.audio_url);a.crossOrigin='anonymous';a.play().catch(()=>{});}} style={{width:30,height:30,borderRadius:'50%',background:C.white,border:`1px solid ${C.purpleBorder}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',flexShrink:0,WebkitTapHighlightColor:'transparent'}}>
+                    <button onClick={async()=>{
+                      try{
+                        const blobUrl=await getPlayableUrl(g.audio_url);
+                        const a=new Audio(blobUrl);
+                        a.play().catch(e=>console.error(e));
+                      }catch(e){console.error(e);}
+                    }} style={{width:30,height:30,borderRadius:'50%',background:C.white,border:`1px solid ${C.purpleBorder}`,display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',flexShrink:0,WebkitTapHighlightColor:'transparent'}}>
                       <svg width="9" height="11" viewBox="0 0 10 12" fill="none"><path d="M1 1L9 6L1 11V1Z" fill={C.purple}/></svg>
                     </button>
                   )}
